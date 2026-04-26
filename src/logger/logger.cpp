@@ -139,7 +139,14 @@ namespace big
 				std::filesystem::create_directories(backup_folder_path);
 			}
 
-			std::vector<std::pair<std::wstring, uintmax_t>> files;
+			struct backup_file
+			{
+				std::wstring path;
+				uintmax_t size;
+				std::filesystem::file_time_type last_write;
+			};
+
+			std::vector<backup_file> files;
 			uintmax_t total_size = 0;
 
 			for (const auto& entry : std::filesystem::recursive_directory_iterator(backup_folder_path, std::filesystem::directory_options::skip_permission_denied | std::filesystem::directory_options::follow_directory_symlink))
@@ -148,37 +155,40 @@ namespace big
 				{
 					uintmax_t file_size  = entry.file_size();
 					total_size          += file_size;
-					files.emplace_back(entry.path().wstring(), file_size);
+					files.emplace_back(entry.path().wstring(), file_size, entry.last_write_time());
 				}
 			}
 
-			constexpr auto MB_100 = 100 * 1024 * 1024;
-			constexpr auto MB_50  = 50 * 1024 * 1024;
-			if (total_size > MB_100)
+			// Sort files by last write time, oldest first
+			std::sort(files.begin(),
+			          files.end(),
+			          [](const auto& a, const auto& b)
+			          {
+				          return a.last_write < b.last_write;
+			          });
+
+			const auto now           = std::filesystem::file_time_type::clock::now();
+			const auto age_threshold = std::chrono::hours(14 * 24);
+			constexpr auto MB_100    = 100 * 1024 * 1024;
+
+			// Delete logs older than 14 days, then keep deleting oldest until under 100MB
+			for (auto it = files.begin(); it != files.end();)
 			{
-				LOG(WARNING) << "Deleting backup file until folder is under 50MB.";
+				const auto age          = now - it->last_write;
+				bool is_expired         = age > age_threshold;
+				bool is_over_size_limit = total_size > MB_100;
 
-				// Sort files by size in descending order
-				std::sort(files.begin(),
-				          files.end(),
-				          [](const auto& a, const auto& b)
-				          {
-					          return a.second > b.second;
-				          });
-
-				// Delete largest files until size is under 50MB
-				for (const auto& file : files)
+				if (!is_expired && !is_over_size_limit)
 				{
-					if (total_size <= MB_50)
-					{
-						break;
-					}
-					if (std::filesystem::remove(file.first))
-					{
-						LOG(WARNING) << "Deleting backup file " << big::string_conversions::utf16_to_utf8(file.first);
-						total_size -= file.second;
-					}
+					break;
 				}
+
+				if (std::filesystem::remove(it->path))
+				{
+					LOG(WARNING) << "Deleting backup file " << big::string_conversions::utf16_to_utf8(it->path);
+					total_size -= it->size;
+				}
+				it = files.erase(it);
 			}
 		}
 		catch (const std::exception& e)
