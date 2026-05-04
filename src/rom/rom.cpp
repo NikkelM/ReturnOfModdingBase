@@ -5,6 +5,8 @@
 
 #include <string/string_conversions.hpp>
 
+#include <fstream>
+
 namespace rom
 {
 	struct store_reason_to_file
@@ -51,6 +53,83 @@ namespace rom
 			file_stream.close();
 		}
 	};
+
+	// Check if the mod manager profile has a newer mod loader DLL and copy
+	// it to the game directory. Auto-detects the DLL filename from the
+	// module that contains this function. Only called when
+	// rom_modding_root_folder is provided via command line arguments.
+	static void try_update_dll_from_profile(const std::wstring& profile_root)
+	{
+		try
+		{
+			if (profile_root.empty())
+			{
+				return;
+			}
+
+			HMODULE our_module = nullptr;
+			GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			    reinterpret_cast<LPCWSTR>(&try_update_dll_from_profile),
+			    &our_module);
+			if (!our_module)
+			{
+				return;
+			}
+
+			wchar_t dll_path_buf[MAX_PATH * 4];
+			const auto dll_path_len = GetModuleFileNameW(our_module, dll_path_buf, sizeof(dll_path_buf) / sizeof(dll_path_buf[0]));
+			if (dll_path_len == 0)
+			{
+				return;
+			}
+
+			const std::filesystem::path game_dll(std::wstring(dll_path_buf, dll_path_len));
+			const auto dll_name    = game_dll.filename();
+			const auto game_dir    = game_dll.parent_path();
+			const auto profile_dll = std::filesystem::path(profile_root) / dll_name;
+
+			if (!std::filesystem::exists(profile_dll) || !std::filesystem::exists(game_dll))
+			{
+				return;
+			}
+
+			const auto profile_size = std::filesystem::file_size(profile_dll);
+			const auto game_size    = std::filesystem::file_size(game_dll);
+
+			if (profile_size == game_size)
+			{
+				return;
+			}
+
+			const auto game_dll_old = game_dir / (dll_name.string() + ".old");
+
+			// Rename the loaded DLL, then copy the new one into place.
+			std::error_code ec;
+			std::filesystem::remove(game_dll_old, ec);
+			std::filesystem::rename(game_dll, game_dll_old, ec);
+			if (ec)
+			{
+				LOG(WARNING) << "[ROM] Failed to rename " << dll_name << " for update: " << ec.message();
+				return;
+			}
+
+			std::filesystem::copy_file(profile_dll, game_dll, std::filesystem::copy_options::overwrite_existing, ec);
+			if (ec)
+			{
+				LOG(WARNING) << "[ROM] Failed to copy updated " << dll_name << " from profile: " << ec.message();
+				std::filesystem::rename(game_dll_old, game_dll);
+				return;
+			}
+
+			LOG(INFO) << "[ROM] Updated " << dll_name << " from profile"
+			          << " (size " << game_size << " -> " << profile_size << ")."
+			          << " The update will take effect on next launch.";
+		}
+		catch (const std::exception& e)
+		{
+			LOG(WARNING) << "[ROM] DLL update check failed: " << e.what();
+		}
+	}
 
 	bool is_rom_enabled()
 	{
@@ -114,6 +193,13 @@ namespace rom
 				if (has_rom_enabled_arg_name || has_root_folder_arg_name)
 				{
 					rom_enabled_set = true;
+
+					// If launched with command line args, check if the profile
+					// has a newer mod loader DLL and update the game copy.
+					if (has_root_folder_arg_name && root_folder.size())
+					{
+						try_update_dll_from_profile(root_folder);
+					}
 
 					if (has_rom_enabled_arg_name)
 					{
